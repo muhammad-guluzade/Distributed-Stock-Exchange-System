@@ -164,8 +164,6 @@ def select_best_server_loop():
             switch_connection(*best)
 
 
-
-
 def user_input_loop():
     global tcp_sock, server_address, server_port
 

@@ -30,7 +30,6 @@ def set_broadcast_address():
     server_address = local_ip
     broadcast_address = str(network.broadcast_address)
 
-
 def discovery():
     # save global view of servers
     # receive up-to-date order book
