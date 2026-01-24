@@ -7,7 +7,7 @@ import time
 import netifaces
 
 server_address = None
-server_port = 5678
+server_port = None
 broadcast_address = None
 broadcast_port = 1234
 server_socket = None
@@ -51,15 +51,21 @@ def connection_listen():
 def handle_client(connection):
     global crashed
     while not crashed:
-        request = connection.recv(1024)
-        if request == "PING":
-            response = f"PONG"
+        data = connection.recv(1024)
+        msg = data.decode().strip()
+        if msg == "PING":
+            response = "PONG"
             connection.sendall(response.encode())
-            connection.close()
+            print("sent pong")
             break
-        elif request == "":
+        elif msg == "update":
             response = "info"
             connection.sendall(response.encode())
+            print("sent info")
+        else:
+            response = "Incorrect formatting!"
+            connection.sendall(response.encode())
+            print("sent error response")
     connection.close()
 
 def broadcast_listen():
@@ -73,30 +79,30 @@ def broadcast_listen():
     print("Listening to broadcast announcements")
     while not crashed:
         data, addr = broadcast_socket.recvfrom(1024)
-        if data == "CRASH":
+        if data == "CRASH" and not crashed:
             election()
     broadcast_socket.close()
 
 def crash():
-    global crashed, broadcast_address, broadcast_port
+    global crashed, broadcast_address, broadcast_port, server_port
     crashed = True
     # Create a UDP socket
     broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # Enable permission to send to broadcast addresses
     broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     # Send the broadcast announcement
-    broadcast_socket.sendto(str.encode("CRASH"), (broadcast_address, broadcast_port))
+    broadcast_socket.sendto(str.encode(f"CRASH|{server_port}"), (broadcast_address, broadcast_port))
 
 def heartbeat():
-    global crashed, broadcast_address, broadcast_port
+    global crashed, broadcast_address, broadcast_port, server_port
     # Create a UDP socket
     broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # Enable permission to send to broadcast addresses
     broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     while not crashed:
-        broadcast_socket.sendto(str.encode(f"HELLO|{server_address}"), (broadcast_address, broadcast_port))
-        print("sent heartbeat")
-        time.sleep(5)
+        broadcast_socket.sendto(f"HELLO|{server_port}".encode(), (broadcast_address, broadcast_port))
+        # print("sent heartbeat")
+        time.sleep(1)
     broadcast_socket.close()
 
 
@@ -106,11 +112,14 @@ if __name__ == "__main__":
     print("Local IP:", server_address)
     print("Broadcast:", broadcast_address)
     discovery()
-    print(f"Server running on {server_address}:{server_port}")
 
     # listen for client connections
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((server_address, server_port))
+    server_socket.bind((server_address, 0))
+    server_port = server_socket.getsockname()[1]
+
+    print(f"Server running on {server_address}:{server_port}")
+
     connection_listener_thread = threading.Thread(target=connection_listen, daemon=True)
     connection_listener_thread.start()
 
