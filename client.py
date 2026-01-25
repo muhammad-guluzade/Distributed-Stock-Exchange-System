@@ -19,14 +19,14 @@ connection_lost_logged = False
 
 def broadcast_listener():
     global server_address, server_port, tcp_sock
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind(("0.0.0.0", broadcast_port))
+    broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    broadcast_sock.bind(("0.0.0.0", broadcast_port))
 
     print("[Broadcast Listener] Waiting for HELLO/CRASH...")
 
     while True:
-        data, addr = udp_sock.recvfrom(1024)
+        data, addr = broadcast_sock.recvfrom(1024)
         msg = data.decode().strip()
         ip = addr[0]
 
@@ -67,7 +67,6 @@ def broadcast_listener():
                         server_port = None
 
 
-
 def measure_server_rtt(ip, port, timeout=2):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -83,12 +82,8 @@ def measure_server_rtt(ip, port, timeout=2):
         if not data:
             return float("inf")
         return rtt
-    except Exception:
+    except socket.timeout:
         return float("inf")
-
-
-
-
 
 def connect_tcp(ip, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
