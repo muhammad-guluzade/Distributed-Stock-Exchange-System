@@ -27,26 +27,34 @@ group_view_lock = threading.Lock()
 order_book = {"NVIDIA": ([(198, 24, "127.0.0.1", 42),(200, 55, "127.0.0.1", 43)], [(205, 14, "127.0.0.1", 55),(206, 66,  "127.0.0.1", 96)],[(25, "127.0.0.1", 55), (120, "127.0.0.1", 96)]),
               "APPLE":([],[],[]),
               "Balance": ([(20000, "127.0.0.1", 42), (12000, "127.0.0.1", 43)])}
-
+order_book_lock = threading.Lock()
 
 MULTICAST_GROUP = "239.1.1.1"
 MULTICAST_PORT = 5000
 
 # the number of messages this server has sent to the group
-S = 0
-S_lock = threading.Lock()
+S_f = 0
+S_f_lock = threading.Lock()
 # sequence number of latest message from each server
 R_f = {}
 R_f_lock = threading.Lock()
 fifo_holdback_queues = {}
 fifo_holdback_lock = threading.Lock()
 delivery = []
+delivery_lock = threading.Lock()
+
+received_first_view = False
+received_first_view_lock = threading.Lock()
+crashed_servers = []
 
 multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+multicast_socket_lock = threading.Lock()
 
-received_first_view = False
-crashed_servers = []
+sent_messages = {}
+sent_messages_lock = threading.Lock()
+
+holdback_queues = {}
 
 S_b = 0
 R_b = {}
@@ -244,7 +252,7 @@ def discovery():
 
     if nearest is None:
         # make ourselves the leader
-        with leader_lock, group_view_lock:
+        with leader_lock, group_view_lock, R_b_lock, R_f_lock, received_first_view_lock:
             leader = (server_address, server_port)
             isLeader = True
             group_view = [(server_address, server_port)]
@@ -278,7 +286,8 @@ def discovery():
                 if line.startswith("BOOK|"):
                     book_json = line[5:]
                     global order_book
-                    order_book = restore_order_book(json.loads(book_json))
+                    with order_book_lock:
+                        order_book = restore_order_book(json.loads(book_json))
                     print("Received order book")
 
                 elif line.startswith("LEADER|"):
@@ -363,9 +372,11 @@ def handle_tcp(connection):
                 connection.sendall(b"info\n")
                 print("sent info")
             elif msg == "INFO":
-                connection.sendall(f"BOOK|{json.dumps(order_book)}\n".encode())
-                connection.sendall(f"LEADER|{leader[0]}|{leader[1]}\n".encode())
-                connection.sendall(f"ACKS|{json.dumps(R)}\n".encode())
+                with order_book_lock, leader_lock, R_f_lock, R_b_lock:
+                    connection.sendall(f"BOOK|{json.dumps(order_book)}\n".encode())
+                    connection.sendall(f"LEADER|{leader[0]}|{leader[1]}\n".encode())
+                    connection.sendall(f"B_ACKS|{json.dumps(R_b)}\n".encode())
+                    connection.sendall(f"F_ACKS|{json.dumps(R_f)}\n".encode())
                 print(f"Gave current order book to ({ip}:{port})")
 
             elif msg.startswith("VIEW|"):
