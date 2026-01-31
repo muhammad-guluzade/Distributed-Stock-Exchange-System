@@ -4,6 +4,8 @@ import os
 import ipaddress
 import threading
 import time
+from random import Random
+import uuid
 import netifaces
 import json
 
@@ -34,9 +36,10 @@ MULTICAST_PORT = 5000
 S = 0
 S_lock = threading.Lock()
 # sequence number of latest message from each server
-R = {}
-R_lock = threading.Lock()
-holdback = []
+R_f = {}
+R_f_lock = threading.Lock()
+fifo_holdback_queues = {}
+fifo_holdback_lock = threading.Lock()
 delivery = []
 
 multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -44,6 +47,150 @@ multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 
 received_first_view = False
 crashed_servers = []
+
+S_b = 0
+R_b = {}
+S_b_lock = threading.Lock()
+R_b_lock = threading.Lock()
+# can grow infinitely
+Received = {}
+
+server_id = str(uuid.uuid4())
+
+def B_multicast(msg):
+    global S_b, multicast_socket
+    with S_b_lock, multicast_socket_lock, sent_messages_lock:
+        S_b = S_b + 1
+        multicast_socket.sendto(f"{server_port}|{server_id}|{S_b}|{msg}".encode(), (MULTICAST_GROUP, MULTICAST_PORT))
+        sent_messages[S_b] = {
+            "msg": msg,
+            "acks": set()
+        }
+
+def B_deliver(msg):
+    global Received
+    ip = msg[0]
+    port = msg[1]
+    id = msg[2]
+    S = msg[3]
+    payload = msg[4]
+    if (ip, port, id, S) not in Received:
+        Received[(ip, port, id, S)] = payload
+        if (ip, port, id) != (server_address,server_port, server_id):
+            B_multicast(payload)
+        R_deliver(payload)
+
+def B_listen():
+    global crashed, group_view, delivery
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", MULTICAST_PORT))
+    mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+    while not crashed:
+        data, addr = sock.recvfrom(4096)
+        raw_message = data.decode().strip()
+        ip = addr[0]
+        port, S_str, payload = raw_message.split('|')
+        port = int(port)
+        S = int(S_str)
+
+        sender = (ip, port)
+        deliver_list = []
+        with R_b_lock:
+            expected = R_b[sender] + 1
+            if S == expected:
+                deliver_list.append((ip, port, S, payload))
+                R_b[sender] += 1
+                # look through holdback queue
+                while sender in holdback_queues and (R_b[sender] + 1 in holdback_queues[sender]):
+                    next_seq = R_b[sender] + 1
+                    deliver_list.append(holdback_queues[sender].pop(next_seq))
+                    R_b[sender] += 1
+            elif S > expected:
+                # missed a message, saving received message in holdback queue
+                nack(sender, S, R_b[sender])
+                if sender not in holdback_queues:
+                    holdback_queues[sender] = {}
+                holdback_queues[sender][S] = payload
+        for msg in deliver_list:
+            B_deliver(msg)
+
+def R_deliver(msg):
+    global fifo_holdback_queues
+    S = msg.split('|')[0]
+    ip = msg.split('|')[1]
+    port = msg.split('|')[2]
+    payload = msg.split('|')[3]
+    sender = (ip, port)
+    deliver_list = []
+    with R_f_lock:
+        expected = R_f[sender] + 1
+        if S == expected:
+            deliver_list.append((ip, port, payload))
+            R_f[sender] += 1
+
+            while sender in fifo_holdback_queues and (R_f[sender] + 1 in fifo_holdback_queues[sender]):
+                next_seq = R_f[sender] + 1
+                deliver_list.append(fifo_holdback_queues[sender].pop(next_seq))
+                R_f[sender] += 1
+
+        elif S > expected:
+            if sender not in fifo_holdback_queues:
+                fifo_holdback_queues[sender] = {}
+            fifo_holdback_queues[sender][S] = payload
+    for (ip, port, payload) in deliver_list:
+        FIFO_deliver(ip, port, payload)
+
+def R_multicast(msg):
+    B_multicast(msg)
+
+def FIFO_multicast(msg):
+    global holdback, S_f, R_f
+    with S_f_lock:
+        S_f += 1
+        R_multicast(f"{S_f}|{server_address}|{server_port}|{msg}")
+
+
+def FIFO_deliver(ip, port, msg):
+    if msg == "CRASH":
+        print(f"Server ({ip}:{port}) crashed!")
+        if not received_first_view:
+            crashed_servers.append((ip, port))
+        else:
+            with group_view_lock:
+                group_view.remove((ip, port))
+        if (server_address, server_port) in group_view:
+            election()
+
+    if msg == "JOIN":
+        print(f"New server joined ({ip}:{port})")
+        if (ip, port) not in group_view:
+            with group_view_lock:
+                group_view.append((ip, port))
+        if (ip, port) not in R_b:
+            with R_b_lock, R_f_lock:
+                R_b[(ip, port)] = 0
+                R_f[(ip, port)] = 0
+        if isLeader:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # send view to new server
+    if msg.startswith("UPDATE|"):
+        update = msg.split("|")[3]
+        print(f"Applying update {update}")
+        apply_update(update)
+
+
+def apply_update(update):
+    with order_book_lock:
+        pass
+
+def nack(adr, S, R):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(adr)
+    s.sendall(f"NACK|{S}|{R}".encode())
+    s.close()
 
 def set_broadcast_address():
     global server_address, broadcast_address
@@ -91,7 +238,7 @@ def find_nearest_server():
         return None
 
 def discovery():
-    global leader, group_view, received_first_view
+    global leader, group_view, received_first_view, R_b, isLeader, R_f
 
     nearest = find_nearest_server()
 
@@ -101,6 +248,8 @@ def discovery():
             leader = (server_address, server_port)
             isLeader = True
             group_view = [(server_address, server_port)]
+            R_b = {(server_address, server_port): 0}
+            R_f = {(server_address, server_port): 0}
             received_first_view = True
         print("Found no other servers; this server was declared the leader.")
     else:
@@ -140,16 +289,22 @@ def discovery():
                         group_view.append(leader)
                         print("Leader is", leader)
 
-                elif line.startswith("ACKS|"):
-                    global R
-                    with R_lock:
-                        R = json.loads(line.split("|")[1])
-                        print("Received sequence numbers:", R)
+                elif line.startswith("B_ACKS|"):
+                    global R_b
+                    with R_b_lock:
+                        R_b = json.loads(line.split("|")[1])
+                        print("Received basic sequence numbers:", R_b)
+
+                elif line.startswith("F_ACKS|"):
+                    global R_f
+                    with R_f_lock:
+                        R_f = json.loads(line.split("|")[1])
+                        print("Received FIFO sequence numbers:", R_f)
 
                 else:
                     print("Unknown line:", line)
 
-            send_to_leader(f"JOIN")
+            FIFO_multicast(f"JOIN")
             # nearest or leader crashed?
             with group_view_lock, leader_lock:
                 if nearest in group_view and leader in group_view:
@@ -165,55 +320,6 @@ def discovery():
     # start multicast listener thread for updates from leader
     # or if elected start thread for backend and distributing updates
     return True
-
-
-def multicast(msg):
-    global S, multicast_socket
-    with S_lock:
-        S = S + 1
-        multicast_socket.sendto((msg + f"|{server_port}|{S}|{json.dumps(R)}").encode(), (MULTICAST_GROUP, MULTICAST_PORT))
-
-def multicast_listen():
-    global crashed, group_view, delivery, holdback
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", MULTICAST_PORT))
-    mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-    while not crashed:
-        data, addr = sock.recvfrom(4096)
-        msg = data.decode().strip()
-        ip = addr[0]
-        port = msg.split('|')[1]
-        s = msg.split('|')[2]
-        acks = json.loads(msg.split('|')[3])
-
-        with S_lock, R_lock:
-            if S == R[(ip, port)] + 1:
-                delivery.append((msg, addr))
-
-
-def multicast_deliver(msg, addr):
-        ip = addr[0]
-        port = msg.split('|')[1]
-        if msg.startswith("CRASH|"):
-            with group_view_lock:
-                group_view.remove((ip, port))
-            if not received_first_view:
-                crashed_servers.append((ip, port))
-            if (server_address, server_port) in group_view:
-                election()
-
-        if msg.startswith("NEW|"):
-            ip = msg.split("|")[1]
-            port = msg.split("|")[2]
-            print(f"New server joined ({ip}:{port})")
-            if (ip, port) not in group_view:
-                group_view.append((ip, port))
-            if (ip, port) not in R:
-                R[(ip, port)] = 0
-
 
 def connection_listen():
     global server_socket, crashed
@@ -256,7 +362,6 @@ def handle_tcp(connection):
             elif msg == "UPDATE":
                 connection.sendall(b"info\n")
                 print("sent info")
-
             elif msg == "INFO":
                 connection.sendall(f"BOOK|{json.dumps(order_book)}\n".encode())
                 connection.sendall(f"LEADER|{leader[0]}|{leader[1]}\n".encode())
@@ -268,12 +373,25 @@ def handle_tcp(connection):
 
                 received_first_view = True
                 #delete from view crashed servers
+            elif msg.startswith("ACK|"):
+                s = int(msg.split("|")[1])
+                with sent_messages_lock:
+                    sent_messages[s][1].add((ip, port))
+                    if all(e in sent_messages[s][1] for e in group_view):
+                        del sent_messages[s]
+
+            elif msg.startswith("NACK|"):
+                s = int(msg.split("|")[1])
+                r = int(msg.split("|")[2])
+                with multicast_socket_lock:
+                    for i in range(r+1, s):
+                        multicast_socket.sendall(f"{server_port}|{i}|{sent_messages[i][0]}".encode())
             elif not isLeader:
                 connection.sendall(b"Incorrect formatting!\n")
                 print("sent error response")
             elif isLeader:
-                if msg == "JOIN":
-                    multicast(f"NEW|{ip}|{port}")
+
+                continue
     connection.close()
 
 def restore_order_book(book):
