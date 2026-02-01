@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import time
@@ -17,6 +18,15 @@ switch_request = None
 switch_lock = threading.Lock()
 connection_lost_logged = False
 
+crashed = False
+
+username = ""
+
+order_book = None
+balance = None
+owned_stocks = None
+
+
 def broadcast_listener():
     global server_address, server_port, tcp_sock
     broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -25,22 +35,15 @@ def broadcast_listener():
 
     print("[Broadcast Listener] Waiting for HELLO/CRASH...")
 
-    while True:
+    while not crashed:
         data, addr = broadcast_sock.recvfrom(1024)
         msg = data.decode().strip()
         ip = addr[0]
 
         parts = msg.split("|")
 
-        if len(parts) != 2:
-            continue  # ignore malformed packet
-
-        msg, port_str = parts
-
-        try:
-            port = int(port_str)
-        except ValueError:
-            continue  # bad port, ignore packet
+        msg, port_str, id_str = parts
+        port = int(port_str)
 
         with lock:
             if msg == "HELLO":
@@ -94,24 +97,22 @@ def connect_tcp(ip, port):
 def switch_connection(ip, port):
     global tcp_sock, server_address, server_port
 
+    if tcp_sock is not None:
+        with tcp_lock:
+            tcp_sock.sendall(f"LOGOUT\n".encode())
+            tcp_sock.close()
     new_sock = connect_tcp(ip, port)
 
     with tcp_lock:
-        old = tcp_sock
         tcp_sock = new_sock
         server_address, server_port = ip, port
-
-    if old:
-        try:
-            old.close()
-        except Exception:
-            pass
+        tcp_sock.sendall(f"LOGIN|{username}\n".encode())
 
 
 def select_best_server_loop():
     global connection_lost_logged
 
-    while True:
+    while not crashed:
         time.sleep(5)
 
         with lock:
@@ -160,37 +161,202 @@ def select_best_server_loop():
 
 
 def user_input_loop():
-    global tcp_sock, server_address, server_port
+    global tcp_sock, server_address, server_port, crashed
 
-    while True:
-        msg = input("Enter the message:\n")
+    while not crashed:
+        # try:
+            display_market()
+            msg = input(
+                "Choose one:\n"
+                "(1) Deposit money\n"
+                "(2) Withdraw money\n"
+                "(3) Deposit stock\n"
+                "(4) Withdraw stock\n"
+                "(5) Buy stock\n"
+                "(6) Sell stock\n"
+                "(7) Refresh market\n"
+                "(8) Logout\n"
+                "(9) Crash\n"
+            )
 
+            if msg == "1":
+                amount = int(input("Amount to deposit: "))
+                if amount <= 0:
+                    print("Amount to deposit must be greater than 0")
+                    time.sleep(2)
+                    continue
+                else:
+                    with tcp_lock:
+                        tcp_sock.sendall(f"BALANCE_CHANGE|{amount}\n".encode())
+
+            elif msg == "2":
+                amount = int(input("Amount to withdraw: "))
+                if amount <= 0:
+                    print("Amount to withdraw must be greater than 0")
+                    time.sleep(2)
+                    continue
+                elif amount > balance:
+                    print("You do not have enough funds")
+                    time.sleep(2)
+                    continue
+                else:
+                    with tcp_lock:
+                        tcp_sock.sendall(f"BALANCE_CHANGE|{-int(amount)}\n".encode())
+
+            elif msg == "3":
+                stock = input("Stock symbol: ")
+                if stock == "Balances":
+                    print("Incorrect stock name")
+                    time.sleep(2)
+                    continue
+                amount = int(input("Amount to deposit: "))
+                if amount <= 0:
+                    print("Amount to deposit must be greater than 0")
+                    time.sleep(2)
+                    continue
+                with tcp_lock:
+                    tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{amount}\n".encode())
+
+            elif msg == "4":
+                stock = input("Stock symbol: ")
+                if stock == "Balances":
+                    print("Incorrect stock name")
+                    time.sleep(2)
+                    continue
+                if stock not in order_book or stock not in owned_stocks:
+                    print("You don't own the stock")
+                    time.sleep(2)
+                    continue
+                amount = int(input("Amount to withdraw: "))
+                if amount <= 0:
+                    print("Amount to withdraw must be greater than 0")
+                    time.sleep(2)
+                    continue
+                if amount > int(owned_stocks[stock]):
+                    print("You do not own enough stock")
+                    time.sleep(2)
+                with tcp_lock:
+                    tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{-int(amount)}\n".encode())
+
+            elif msg == "5":
+                stock = input("Stock symbol: ")
+                if stock == "Balances":
+                    print("Incorrect stock name")
+                    time.sleep(2)
+                    continue
+
+                price = int(input("Price per stock: "))
+                if price < 0:
+                    print("Price per stock must not be negative")
+                    time.sleep(2)
+                    continue
+                amount = int(input("Amount: "))
+                if amount <= 0:
+                    print("Amount must be greater than 0")
+                    time.sleep(2)
+                    continue
+
+                total_buy_orders = 0
+                for possible_stock, (buy_orders, _) in order_book.items():
+                    if possible_stock != "Balance":
+                        for pr, amt, own in buy_orders:
+                            if own == username:
+                                total_buy_orders += int(pr) * int(amt)
+                if price * amount > balance - total_buy_orders:
+                    print("You do not have enough funds")
+                    time.sleep(2)
+                    # continue
+
+                with tcp_lock:
+                    tcp_sock.sendall(f"BUY_ORDER|{stock}|{price}|{amount}\n".encode())
+
+            elif msg == "6":
+                stock = input("Stock symbol: ")
+                if stock == "Balances":
+                    print("Incorrect stock name")
+                    time.sleep(2)
+                    continue
+                if stock not in order_book or stock not in owned_stocks:
+                    print("You do not own the stock")
+                    time.sleep(2)
+                    continue
+                price = int(input("Price per stock: "))
+                if price < 0:
+                    print("Price per stock must not be negative")
+                    time.sleep(2)
+                    continue
+                amount = int(input("Amount: "))
+                if amount <= 0:
+                    print("Amount must be greater than 0")
+                    time.sleep(2)
+                    continue
+
+                total_sell_orders = 0
+                for pr, amt, own in order_book[stock][1]:
+                      if own == username:
+                          total_sell_orders += int(amt)
+                if  amount > int(owned_stocks[stock]) - total_sell_orders:
+                    print("You do not own enough stock")
+                    time.sleep(2)
+                    continue
+                tcp_sock.sendall(f"SELL_ORDER|{stock}|{price}|{amount}\n".encode())
+
+            elif msg == "7":
+                continue
+
+            elif msg == "8":
+                tcp_sock.sendall("LOGOUT\n".encode())
+                tcp_sock.close()
+                print("You logged out")
+                break
+
+            elif msg == "9":
+                crashed = True
+                tcp_sock.sendall("LOGOUT".encode())
+                tcp_sock.close()
+
+        # except Exception:
+        #     print("⚠ Connection lost!")
+        #     global connection_lost_logged
+        #     connection_lost_logged = True
+        #
+        #     with tcp_lock:
+        #         try: tcp_sock.close()
+        #         except: pass
+        #         tcp_sock = None
+        #         server_address = None
+        #         server_port = None
+        #     while not tcp_sock:
+        #         time.sleep(2)
+
+def refresher():
+    global order_book, balance, owned_stocks
+    while not crashed:
         with tcp_lock:
-            s = tcp_sock
+            if tcp_sock is not None:
+                tcp_sock.sendall(f"REFRESH\n".encode())
+                buffer = ""
+                lines = []
+                while not crashed and len(lines) < 3:
+                    chunk = tcp_sock.recv(4096).decode()
+                    if not chunk:
+                        raise ConnectionError("Server closed connection during startup")
 
-        if not s:
-            print("❌ No server connected. Waiting for failover...")
-            continue
+                    buffer += chunk
+                    while "\n" in buffer and len(lines) < 3:
+                        line, buffer = buffer.split("\n", 1)
+                        lines.append(line)
 
-        try:
-            s.sendall(msg.encode())
-            resp = s.recv(1024)
-            if resp:
-                print("Server replied:", resp.decode())
+                for line in lines:
+                    if line.startswith("ORDERS|"):
+                        order_book = json.loads(line.split("|", 1)[1])
 
-        except Exception:
-            print("⚠ Connection lost!")
-            global connection_lost_logged
-            connection_lost_logged = False
+                    elif line.startswith("BALANCE|"):
+                        balance = int(line.split("|")[1])
 
-            with tcp_lock:
-                try: s.close()
-                except: pass
-                tcp_sock = None
-                server_address = None
-                server_port = None
-
-
+                    elif line.startswith("OWNED_STOCKS|"):
+                        owned_stocks = json.loads(line.split("|", 1)[1])
+        time.sleep(5)
 
 if __name__ == "__main__":
     threading.Thread(target=broadcast_listener, daemon=True).start()
@@ -210,4 +376,3 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(1)
-

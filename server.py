@@ -3,6 +3,8 @@ import ipaddress
 import threading
 import time
 import uuid
+from threading import get_native_id
+
 import netifaces
 import json
 
@@ -18,12 +20,9 @@ isLeader = False
 group_view = {}
 group_view_lock = threading.Lock()
 
-# nickname instead of (ip, port)
-# stock_name: ([(buy_price, buy_amount, buyer_ip, buyer_port),(...)],[(sell_price, sell_amount, seller_ip, seller_port),(...)], [(owned_amount, owner_ip, owner_port),(...)])
-# Balance:  ([(balance, owner_ip, owner_port), (...)])
-order_book = {"NVIDIA": ([(198, 24, "127.0.0.1", 42),(200, 55, "127.0.0.1", 43)], [(205, 14, "127.0.0.1", 55),(206, 66,  "127.0.0.1", 96)],[(25, "127.0.0.1", 55), (120, "127.0.0.1", 96)]),
-              "APPLE":([],[],[]),
-              "Balance": ([(20000, "127.0.0.1", 42), (12000, "127.0.0.1", 43)])}
+order_book = {"NVIDIA": ([(200, 24, "Max"),(198, 55, "Paul")], [(205, 14, "Max"),(206, 66,  "Paul")],{"Max": 10000, "Paul":250}),
+              "APPLE":([],[],{}),
+              "Balance": {"Max": 5000, "Paul":12000}}
 order_book_lock = threading.Lock()
 
 MULTICAST_GROUP = "239.1.1.1"
@@ -43,13 +42,28 @@ delivery_lock = threading.Lock()
 received_first_view = False
 received_first_view_lock = threading.Lock()
 crashed_servers = []
-
+new_servers = []
+changed_servers_lock = threading.Lock()
+inc_changes = []
 multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 multicast_socket_lock = threading.Lock()
 
+leader = None
+leader_lock = threading.Lock()
+isLeader = False
+leader_socket = None
+leader_queue_lock = threading.Lock()
+leader_queue = []
+
+election_results_lock = threading.Lock()
+election_results = {}
+
 sent_messages = {}
 sent_messages_lock = threading.Lock()
+
+client_lock = threading.Lock()
+client_list = {}
 
 holdback_queues = {}
 
@@ -69,7 +83,7 @@ def pr(*args, **kwargs):
         print(*args, **kwargs)
 
 def B_deliver(msg):
-    # pr("B delivered a message:", msg)
+    # pr("B delivered message:", msg)
     global Received
     S = msg[0]
     id = msg[1]
@@ -109,25 +123,26 @@ def B_listen():
         S = int(S_str)
 
         deliver_list = []
-        with R_b_lock:
-            if sender_id in R_b:
-                expected = R_b[sender_id] + 1
-                if S == expected:
-                    deliver_list.append((S, sender_id, payload))
-                    R_b[sender_id] += 1
-                    # look through holdback queue
-                    while sender_id in holdback_queues and (R_b[sender_id] + 1 in holdback_queues[sender_id]):
-                        next_seq = R_b[sender_id] + 1
-                        deliver_list.append((next_seq, sender_id, holdback_queues[sender_id].pop(next_seq)))
+        if not crashed:
+            with R_b_lock:
+                if sender_id in R_b:
+                    expected = R_b[sender_id] + 1
+                    if S == expected:
+                        deliver_list.append((S, sender_id, payload))
                         R_b[sender_id] += 1
-                elif S > expected:
-                    # missed a message, saving received message in holdback queue
-                    nack(S, sender_id, R_b[sender_id])
-                    if sender_id not in holdback_queues:
-                        holdback_queues[sender_id] = {}
-                    holdback_queues[sender_id][S] = payload
-        for msg in deliver_list:
-            B_deliver(msg)
+                        # look through holdback queue
+                        while sender_id in holdback_queues and (R_b[sender_id] + 1 in holdback_queues[sender_id]):
+                            next_seq = R_b[sender_id] + 1
+                            deliver_list.append((next_seq, sender_id, holdback_queues[sender_id].pop(next_seq)))
+                            R_b[sender_id] += 1
+                    elif S > expected:
+                        # missed a message, saving received message in holdback queue
+                        nack(S, sender_id, R_b[sender_id])
+                        if sender_id not in holdback_queues:
+                            holdback_queues[sender_id] = {}
+                        holdback_queues[sender_id][S] = payload
+            for msg in deliver_list:
+                B_deliver(msg)
 
 def B_multicast(msg):
     global S_b, multicast_socket
@@ -175,19 +190,38 @@ def R_deliver(msg):
     for (id, payload) in deliver_list:
         FIFO_deliver(sender_id, payload)
 
+
 def FIFO_deliver(id, msg):
-    pr("Delivered a FIFO message: ", msg, "from", id)
+    global leader, isLeader, inc_changes, leader_socket
+    pr("FIFO delivered message: ", msg, "from", id)
     if msg == "CRASH":
         with group_view_lock:
             ip, port = group_view[id]
         pr(f"Server ({ip}:{port}|{id}) crashed!")
+
+        with group_view_lock:
+            if id in group_view and id is not leader:
+                inc_changes.append(f"CRASH|{id}")
+
+        if isLeader :
+            FIFO_multicast(f"CONFIRMCRASH|{id}")
+
+        if id is leader:
+            FIFO_deliver(f"CONFIRMCRASH|{id}")
+
+    if msg.startswith("CONFIRMCRASH"):
+        id = msg.split("|")[1]
         if not received_first_view:
-            crashed_servers.append(id)
+            with changed_servers_lock:
+                crashed_servers.append(id)
         else:
             with group_view_lock:
-                del group_view[id]
-        if id in group_view:
-            # election()
+                change = f"CRASH|{id}"
+                if id in group_view:
+                    if change in inc_changes:
+                        inc_changes.remove(change)
+                        del group_view[id]
+            election(change)
             pr("Starting election")
 
     if msg.startswith("NEW|"):
@@ -195,18 +229,85 @@ def FIFO_deliver(id, msg):
         port = int(msg.split("|")[2])
         id = msg.split("|")[3]
         pr(f"New server joined ({ip}:{port}:{id})")
-        with group_view_lock:
-            group_view[id] = (ip, port)
-        if id not in R_b:
-            with R_b_lock, R_f_lock:
-                R_b[id] = 0
-                R_f[id] = 0
-        # election()
-        pr("Starting election")
-    if msg.startswith("UPDATE|"):
-        update = msg.split("|")[3]
-        pr(f"Applying update {update}")
-        apply_update(update)
+        inc_changes.append(f"NEW|{ip}|{port}|{id}")
+
+        if isLeader :
+            FIFO_multicast(f"CONFIRMNEW|{ip}|{port}|{id}")
+
+    if msg.startswith("CONFIRMNEW|"):
+        ip = msg.split("|")[1]
+        port = int(msg.split("|")[2])
+        id = msg.split("|")[3]
+
+        if not received_first_view:
+            with changed_servers_lock:
+                new_servers[id] = (ip, port)
+        else:
+            with group_view_lock:
+                group_view[id] = (ip, port)
+            if id not in R_b:
+                with R_b_lock, R_f_lock:
+                    R_b[id] = 0
+                    R_f[id] = 0
+                election(f"NEW|{id}", )
+                pr("Starting election")
+
+    if msg.startswith("AVG|"):
+        avg = float(msg.split("|")[1])
+        group_size = int(msg.split("|")[2])
+        identifier = msg.split("|", 3)[3]
+        with election_results_lock:
+            if identifier not in election_results:
+                election_results[identifier] = {}
+            election_results[identifier][id] = avg
+
+            if len(election_results[identifier]) == group_size:
+                results = election_results[identifier]
+
+                best_sid = min(results, key=lambda sid: (results[sid], sid))
+                best_rtt = results[best_sid]
+
+                pr(f"Election winner: {best_sid} (RTT {best_rtt})")
+
+                with leader_lock:
+                    leader = best_sid
+                    if leader == server_id:
+                        isLeader = True
+                        for msg in inc_changes:
+                            FIFO_multicast("CONFIRM" + msg)
+                        inc_changes = []
+                        leader_socket = None
+                    else:
+                        leader_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        leader_socket.connect((group_view[leader][0], group_view[leader][1]))
+                with leader_queue_lock:
+                    for msg in leader_queue:
+                        send_to_leader(msg)
+                del election_results[identifier]
+
+    if msg.startswith("UPDATE|") and id != server_id:
+        updates = json.loads(msg.split("|", 1)[1])
+        pr(f"Applying updates {updates}")
+        apply_updates(updates)
+
+
+def election(identifier):
+    global isLeader, leader_socket
+    with leader_lock:
+        if leader_socket is not None:
+            leader_socket.close()
+            leader_socket = None
+        isLeader = False
+    res = []
+    with group_view_lock:
+        group = group_view.values()
+    for ip, port in group:
+        rtt = measure_server_rtt(ip, port)
+        res.append(rtt)
+    avg = sum(res) / len(res)
+
+    with group_view_lock:
+        FIFO_multicast(f"AVG|{avg}|{len(group_view)}|{identifier}")
 
 
 def apply_update(update):
@@ -333,9 +434,13 @@ def discovery():
                         pr("Received FIFO sequence numbers:", R_f)
 
                 elif line.startswith("VIEW|"):
-                    with group_view_lock:
+                    with group_view_lock, changed_servers_lock:
                         group_view = json.loads(line.split("|")[1])
                         pr("Received view:", group_view)
+                        for crashed_server in crashed_servers:
+                            del group_view[crashed_server]
+                        for new_server in new_servers:
+                            group_view[new_server] = new_servers[new_server]
                 else:
                     pr("Unknown line:", line)
 
@@ -366,13 +471,310 @@ def connection_listen():
         client_thread.start()
     server_socket.close()
 
-def send_to_leader(msg):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    ip, port, _ = leader
-    with leader_lock:
-        s.connect((ip, port))
-    s.sendall(msg.encode())
-    s.close()
+
+def update(update):
+    changes = make_matches(update)
+    apply_updates(changes)
+    if len(changes) > 0:
+        FIFO_multicast(f"UPDATE|{json.dumps(changes)}")
+
+def external_pay_out(uname, amount):
+    print(f"Transferred {-amount}€ to external account of {uname}")
+
+def external_pay_in(uname, amount):
+    print(f"Received {amount}€ from external account of {uname}")
+
+def external_stock_in(uname, stock, amount):
+    print(f"Received {amount} stocks of {stock} from external account of {uname}")
+
+def external_stock_out(uname, stock, amount):
+    print(f"Transferred {-amount} stocks of {stock} to external account of {uname}")
+
+def make_matches(update):
+
+    updates = []
+    if update.startswith("BALANCE_CHANGE|"):
+        uname = update.split("|")[1]
+        amount = int(update.split("|")[2])
+        with order_book_lock:
+            if uname not in order_book["Balance"]:
+                order_book["Balance"][uname] = 0
+
+            if amount < 0:
+                total_buy_orders = 0
+                for possible_stock in order_book:
+                    if possible_stock != "Balance":
+                        for pr, amt, own in order_book[possible_stock][0]:
+                            if own == uname:
+                                total_buy_orders += pr * amt
+                balance = max(order_book["Balance"][uname] - total_buy_orders, 0)
+
+                if balance < -amount:
+                    external_pay_out(uname, -balance)
+                    return [f"BALANCE_CHANGE|{uname}|{-balance}"]
+                else:
+                    external_pay_out(uname, amount)
+            external_pay_in(uname, amount)
+            return [update.strip()]
+
+    elif update.startswith("STOCK_TRANSFER|"):
+        _, stock, uname, amount = update.strip().split("|")
+        amount = int(amount)
+        with (order_book_lock):
+            if stock not in order_book:
+                order_book[stock] = ([],[],{})
+            stock_balances = order_book[stock][2]
+            if uname not in stock_balances:
+                stock_balances[uname] = 0
+
+            if amount < 0:
+                total_sell_orders = 0
+                for pr, amt, own in order_book[stock][1]:
+                      if own == uname:
+                          total_sell_orders += amt
+
+                stock_balance = order_book[stock][2].get(uname, 0) - total_sell_orders
+
+                if stock_balance < -amount:
+                    external_stock_out(uname, stock, -stock_balance)
+                    return [f"STOCK_TRANSFER|{stock}|{uname}|{-stock_balance}"]
+                else:
+                    external_stock_out(uname, stock, amount)
+            external_stock_in(uname, stock, amount)
+            return [update.strip()]
+    elif update.startswith("BUY_ORDER"):
+        _, stock, price, amount, uname = update.strip().split("|")
+        price = int(price)
+        amount = int(amount)
+
+        with order_book_lock:
+            total_buy_orders = 0
+            for possible_stock in order_book:
+                if possible_stock != "Balance":
+                    for pr, amt, own in order_book[possible_stock][0]:
+                        if own == uname:
+                            total_buy_orders += pr * amt
+            balance = max(order_book["Balance"][uname] - total_buy_orders, 0)
+            max_affordable = balance // price
+            amount = min(amount, max_affordable)
+            if stock not in order_book:
+                order_book[stock] = ([],[],{})
+            if len(order_book[stock][1]) > 0:
+                running_amount = 0
+                cost = 0
+                sell_orders = order_book[stock][1]
+
+                i = 0
+                while i < len(sell_orders):
+                    offer_price = sell_orders[i][0]
+                    offer_amount = sell_orders[i][1]
+                    offer_user = sell_orders[i][2]
+                    print("amount, running amount", amount, running_amount)
+                    print("offer infos: ", offer_price, offer_amount, offer_user)
+                    if offer_price > price:
+                        updates.append(f"PUT_BUY_ORDER|{stock}|{price}|{amount - running_amount}|{uname}")
+                        break
+
+                    elif offer_amount < amount - running_amount:
+                        running_amount += offer_amount
+                        cost += offer_amount * offer_price
+                        print("running amount", running_amount)
+                        print("offer amount", offer_amount)
+                        print("offer price", offer_price)
+                        print("cost", cost)
+                        updates.append(f"BALANCE_CHANGE|{offer_user}|{offer_amount * offer_price}")
+                        updates.append(f"STOCK_TRANSFER|{stock}|{offer_user}|{-offer_amount}")
+                        updates.append(f"REDUCE_SELL_ORDER|{stock}|{offer_price}|{offer_amount}|{offer_user}|{offer_amount}")
+                        i += 1
+
+                    elif offer_amount >= amount - running_amount:
+                        bought_amount = amount - running_amount
+                        running_amount += bought_amount
+                        cost += bought_amount * offer_price
+                        updates.append(f"BALANCE_CHANGE|{offer_user}|{bought_amount * offer_price}")
+                        updates.append(f"STOCK_TRANSFER|{stock}|{offer_user}|{-bought_amount}")
+                        updates.append(f"REDUCE_SELL_ORDER|{stock}|{offer_price}|{offer_amount}|{offer_user}|{bought_amount}")
+                        break
+                if cost != 0:
+                    updates.append(f"BALANCE_CHANGE|{uname}|{-cost}")
+                if running_amount != 0:
+                    updates.append(f"STOCK_TRANSFER|{stock}|{uname}|{running_amount}")
+                if i == len(sell_orders) and running_amount < amount:
+                    updates.append(f"PUT_BUY_ORDER|{stock}|{price}|{amount - running_amount}|{uname}")
+            else:
+                updates.append(f"PUT_BUY_ORDER|{stock}|{price}|{amount}|{uname}")
+
+    elif update.startswith("SELL_ORDER"):
+        _, stock, price, amount, uname = update.strip().split("|")
+        price = int(price)
+        amount = int(amount)
+
+        with order_book_lock:
+            if stock not in order_book:
+                return []
+            if uname not in order_book[stock][2]:
+                return []
+
+            total_sell_orders = 0
+            for pr, amt, own in order_book[stock][1]:
+                  if own == uname:
+                      total_sell_orders += amt
+
+            stock_balance = order_book[stock][2].get(uname, 0) - total_sell_orders
+            max_sellable = max(stock_balance, 0)
+            amount = min(amount, max_sellable)
+
+            if len(order_book[stock][0]) > 0:
+                running_amount = 0
+                gain = 0
+                buy_orders = order_book[stock][0]
+
+                i = 0
+                while i < len(buy_orders):
+                    offer_price = buy_orders[i][0]
+                    offer_amount = buy_orders[i][1]
+                    offer_user = buy_orders[i][2]
+                    if offer_price < price:
+                        updates.append(f"PUT_SELL_ORDER|{stock}|{price}|{amount - running_amount}|{uname}")
+                        break
+
+                    elif offer_amount < amount - running_amount:
+                        running_amount += offer_amount
+                        gain += offer_amount * offer_price
+                        updates.append(f"BALANCE_CHANGE|{offer_user}|{- offer_amount * offer_price}")
+                        updates.append(f"STOCK_TRANSFER|{stock}|{offer_user}|{offer_amount}")
+                        updates.append(f"REDUCE_BUY_ORDER|{stock}|{offer_price}|{offer_amount}|{offer_user}|{offer_amount}")
+                        i += 1
+
+                    elif offer_amount >= amount - running_amount:
+                        sold_amount = amount - running_amount
+                        running_amount += sold_amount
+                        gain += sold_amount * offer_price
+                        updates.append(f"BALANCE_CHANGE|{offer_user}|{-sold_amount * offer_price}")
+                        updates.append(f"STOCK_TRANSFER|{stock}|{offer_user}|{sold_amount}")
+                        updates.append(f"REDUCE_BUY_ORDER|{stock}|{offer_price}|{offer_amount}|{offer_user}|{sold_amount}")
+                        break
+                if gain != 0:
+                    updates.append(f"BALANCE_CHANGE|{uname}|{gain}")
+                if running_amount != 0:
+                    updates.append(f"STOCK_TRANSFER|{stock}|{uname}|{-running_amount}")
+                if i == len(buy_orders) and running_amount < amount:
+                    updates.append(f"PUT_SELL_ORDER|{stock}|{price}|{amount - running_amount}|{uname}")
+            else:
+                updates.append(f"PUT_SELL_ORDER|{stock}|{price}|{amount}|{uname}")
+    else:
+        raise Exception
+
+    return updates
+
+def apply_updates(updates):
+    with order_book_lock:
+        for update in updates:
+            if update.startswith("BALANCE_CHANGE|"):
+                _, uname, amount = update.strip().split("|")
+                amount = int(amount)
+                order_book["Balance"][uname] = order_book["Balance"].get(uname, 0) + amount
+
+            elif update.startswith("STOCK_TRANSFER|"):
+                _, stock, uname, amount = update.strip().split("|")
+                amount = int(amount)
+                if stock not in order_book:
+                    order_book[stock] = ([], [], {})
+                stock_balances = order_book[stock][2]
+                stock_balances[uname] = stock_balances.get(uname, 0) + amount
+                if stock_balances[uname] == 0:
+                    order_book[stock][2].pop(uname, None)
+
+            elif update.startswith("PUT_BUY_ORDER|"):
+                _, stock, price, amount, uname = update.strip().split("|")
+                price = int(price)
+                amount = int(amount)
+                if stock not in order_book:
+                    order_book[stock] = ([],[],{})
+                buy_orders = order_book[stock][0]
+
+                i = 0
+                while i < len(buy_orders) and buy_orders[i][0] >= price:
+                    i += 1
+
+                buy_orders.insert(i, (price, amount, uname))
+
+
+            elif update.startswith("PUT_SELL_ORDER|"):
+                _, stock, price, amount, uname = update.strip().split("|")
+                price = int(price)
+                amount = int(amount)
+                if stock not in order_book:
+                    raise Exception
+                sell_orders = order_book[stock][1]
+
+                i = 0
+                while i < len(sell_orders) and sell_orders[i][0] <= price:
+                    i += 1
+
+                sell_orders.insert(i, (price, amount, uname))
+
+            elif update.startswith("REDUCE_BUY_ORDER|"):
+                _, stock, price, amount, uname, by = update.strip().split("|")
+                price = int(price)
+                amount = int(amount)
+                by = int(by)
+
+                if stock not in order_book:
+                    raise Exception
+                buy_orders = order_book[stock][0]
+                for i, (p, a, u) in enumerate(buy_orders):
+                    if p == price and a == amount and u == uname:
+                        new_amount = a - by
+
+                        if new_amount > 0:
+                            buy_orders[i] = (p, new_amount, u)
+                        elif new_amount == 0:
+                            buy_orders.pop(i)  # fully filled
+                        else:
+                            raise Exception
+                        break
+
+            elif update.startswith("REDUCE_SELL_ORDER|"):
+                _, stock, price, amount, uname, by = update.strip().split("|")
+                price = int(price)
+                amount = int(amount)
+                by = int(by)
+
+                if stock not in order_book:
+                    raise Exception
+                sell_orders = order_book[stock][1]
+
+                for i, (p, a, u) in enumerate(sell_orders):
+                    if p == price and a == amount and u == uname:
+                        new_amount = a - by
+
+                        if new_amount > 0:
+                            sell_orders[i] = (p, new_amount, u)
+                        elif new_amount == 0:
+                            sell_orders.pop(i)  # fully filled
+                        else:
+                            raise Exception
+                        break
+            else:
+                raise Exception
+
+
+def get_client_id(ip, port):
+    with client_lock:
+        return client_list[(ip,port)]
+
+def send_info_client(connection):
+    ip, port = connection.getpeername()
+    uname = get_client_id(ip, port)
+    with order_book_lock:
+        book = {k: v[:2] for k, v in order_book.items() if k != "Balance"}
+        balance = order_book["Balance"].get(uname, 0)
+        stocks = {s: v[2][uname] for s, v in order_book.items() if
+                  s != "Balance" and uname in v[2]}  # = {"NVIDIA": 2000, "APPLE":10000}
+    connection.sendall(f"ORDERS|{json.dumps(book)}\n".encode())
+    connection.sendall(f"BALANCE|{balance}\n".encode())
+    connection.sendall(f"OWNED_STOCKS|{json.dumps(stocks)}\n".encode())
 
 def handle_tcp(connection):
     global crashed, isLeader
@@ -392,12 +794,45 @@ def handle_tcp(connection):
             msg = line.strip()
 
             if msg == "PING":
-                connection.sendall(b"PONG\n")
+                connection.sendall("PONG\n".encode())
                 done = True
 
-            elif msg.startswith("UPDATE|"):
-                pr("Need to send Update")
-                connection.sendall(b"info\n")
+            elif msg.startswith("LOGIN|"):
+                uname = msg.split("|")[1]
+                with client_lock:
+                    client_list[(ip, port)] = uname
+
+            elif msg == "REFRESH":
+                send_info_client(connection)
+
+            elif msg.startswith("BALANCE_CHANGE|"):
+                amount = msg.split("|")[1]
+                client_id = get_client_id(ip, port)
+                send_to_leader(f"BALANCE_CHANGE|{client_id}|{amount}\n")
+
+            elif msg.startswith("STOCK_TRANSFER|"):
+                stock = msg.split("|")[1]
+                amount = msg.split("|")[2]
+                client_id = get_client_id(ip, port)
+                send_to_leader(f"STOCK_TRANSFER|{stock}|{client_id}|{amount}\n")
+
+            elif msg.startswith("BUY_ORDER|"):
+                stock = msg.split("|")[1]
+                price = msg.split("|")[2]
+                amount = msg.split("|")[3]
+                client_id = get_client_id(ip, port)
+                send_to_leader(f"BUY_ORDER|{stock}|{price}|{amount}|{client_id}\n")
+
+            elif msg.startswith("SELL_ORDER"):
+                stock = msg.split("|")[1]
+                price = msg.split("|")[2]
+                amount = msg.split("|")[3]
+                client_id = get_client_id(ip, port)
+                send_to_leader(f"SELL_ORDER|{stock}|{price}|{amount}|{client_id}\n")
+
+            elif msg == "LOGOUT":
+                with client_lock:
+                    del client_list[(ip, port)]
                 done = True
 
             elif msg.startswith("JOIN|"):
@@ -444,10 +879,21 @@ def handle_tcp(connection):
                         multicast_socket.sendto(f"{i}|{server_id}|{sent_messages[i]["msg"]}".encode(), (MULTICAST_GROUP, MULTICAST_PORT))
                 done = True
             else:
-                connection.sendall(b"Incorrect formatting!\n")
+                connection.sendall("Incorrect formatting!\n".encode())
                 done = True
 
     connection.close()
+
+
+def send_to_leader(msg):
+    with leader_lock:
+        if leader_socket is not None:
+            leader_socket.sendall(msg.encode())
+        elif isLeader:
+            update(msg)
+        else:
+            with leader_queue_lock:
+                leader_queue.append(msg)
 
 def restore_order_book(book):
     restored = {}
