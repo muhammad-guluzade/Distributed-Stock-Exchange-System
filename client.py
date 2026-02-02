@@ -165,6 +165,7 @@ def user_input_loop():
 
     while not crashed:
         # try:
+            time.sleep(2.5)
             display_market()
             msg = input(
                 "Choose one:\n"
@@ -187,7 +188,10 @@ def user_input_loop():
                     continue
                 else:
                     with tcp_lock:
-                        tcp_sock.sendall(f"BALANCE_CHANGE|{amount}\n".encode())
+                        if tcp_sock:
+                            tcp_sock.sendall(f"BALANCE_CHANGE|{amount}\n".encode())
+                        else:
+                            print("Your message could not be sent. Please try again.")
 
             elif msg == "2":
                 amount = int(input("Amount to withdraw: "))
@@ -236,7 +240,10 @@ def user_input_loop():
                     print("You do not own enough stock")
                     time.sleep(2)
                 with tcp_lock:
-                    tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{-int(amount)}\n".encode())
+                        if tcp_sock:
+                            tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{-int(amount)}\n".encode())
+                        else:
+                            print("Your message could not be sent. Please try again.")
 
             elif msg == "5":
                 stock = input("Stock symbol: ")
@@ -262,13 +269,16 @@ def user_input_loop():
                         for pr, amt, own in buy_orders:
                             if own == username:
                                 total_buy_orders += int(pr) * int(amt)
-                if price * amount > balance - total_buy_orders:
+                if price * amount >= balance - total_buy_orders:
                     print("You do not have enough funds")
                     time.sleep(2)
-                    # continue
+                    continue
 
                 with tcp_lock:
-                    tcp_sock.sendall(f"BUY_ORDER|{stock}|{price}|{amount}\n".encode())
+                        if tcp_sock:
+                            tcp_sock.sendall(f"BUY_ORDER|{stock}|{price}|{amount}\n".encode())
+                        else:
+                            print("Your message could not be sent. Please try again.")
 
             elif msg == "6":
                 stock = input("Stock symbol: ")
@@ -295,11 +305,15 @@ def user_input_loop():
                 for pr, amt, own in order_book[stock][1]:
                       if own == username:
                           total_sell_orders += int(amt)
-                if  amount > int(owned_stocks[stock]) - total_sell_orders:
+                if  amount >= int(owned_stocks[stock]) - total_sell_orders:
                     print("You do not own enough stock")
                     time.sleep(2)
                     continue
-                tcp_sock.sendall(f"SELL_ORDER|{stock}|{price}|{amount}\n".encode())
+                with tcp_lock:
+                    if tcp_sock:
+                        tcp_sock.sendall(f"SELL_ORDER|{stock}|{price}|{amount}\n".encode())
+                    else:
+                        print("Your message could not be sent. Please try again.")
 
             elif msg == "7":
                 continue
@@ -309,11 +323,6 @@ def user_input_loop():
                 tcp_sock.close()
                 print("You logged out")
                 break
-
-            elif msg == "9":
-                crashed = True
-                tcp_sock.sendall("LOGOUT".encode())
-                tcp_sock.close()
 
         # except Exception:
         #     print("⚠ Connection lost!")
@@ -374,5 +383,5 @@ if __name__ == "__main__":
 
     threading.Thread(target=user_input_loop, daemon=True).start()
 
-    while True:
+    while not crashed:
         time.sleep(1)

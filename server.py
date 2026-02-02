@@ -199,15 +199,31 @@ def FIFO_deliver(id, msg):
             ip, port = group_view[id]
         pr(f"Server ({ip}:{port}|{id}) crashed!")
 
-        with group_view_lock:
-            if id in group_view and id is not leader:
-                inc_changes.append(f"CRASH|{id}")
+        with leader_lock, election_results_lock:
+            if leader is None:
+                    for election_instance in election_results:
+                        if "participants" in election_results[election_instance]:
+                            if id in election_results[election_instance]["participants"]:
+                                election_results[election_instance][id] = float('inf')
+                                if len(election_results[election_instance]) - 1 == len(election_results[election_instance]["participants"]):
+                                    resolve_election(election_instance)
 
-        if isLeader :
-            FIFO_multicast(f"CONFIRMCRASH|{id}")
+        with group_view_lock, leader_lock:
+            if id in group_view and id != leader:
+                with inc_changes_lock:
+                    inc_changes.append(f"CONFIRMCRASH|{id}")
 
-        if id is leader:
-            FIFO_deliver(f"CONFIRMCRASH|{id}")
+            if isLeader and id in group_view:
+                pr("FIFO multicasting a crash:", isLeader, id, group_view)
+                FIFO_multicast(f"CONFIRMCRASH|{id}")
+
+        leader_crashed = False
+        with leader_lock:
+            if id == leader:
+                leader_crashed = True
+
+        if leader_crashed:
+            FIFO_deliver(server_id, f"CONFIRMCRASH|{id}")
 
     if msg.startswith("CONFIRMCRASH"):
         id = msg.split("|")[1]
@@ -216,7 +232,7 @@ def FIFO_deliver(id, msg):
                 crashed_servers.append(id)
         else:
             with group_view_lock:
-                change = f"CRASH|{id}"
+                change = f"CONFIRMCRASH|{id}"
                 if id in group_view:
                     if change in inc_changes:
                         inc_changes.remove(change)
@@ -225,19 +241,22 @@ def FIFO_deliver(id, msg):
             pr("Starting election")
 
     if msg.startswith("NEW|"):
+        nearest_id = id
         ip = msg.split("|")[1]
         port = int(msg.split("|")[2])
         id = msg.split("|")[3]
         pr(f"New server joined ({ip}:{port}:{id})")
-        inc_changes.append(f"NEW|{ip}|{port}|{id}")
+        with inc_changes_lock:
+            inc_changes.append(f"CONFIRMNEW|{ip}|{port}|{id}|{nearest_id}")
 
         if isLeader :
-            FIFO_multicast(f"CONFIRMNEW|{ip}|{port}|{id}")
+            FIFO_multicast(f"CONFIRMNEW|{ip}|{port}|{id}|{nearest_id}")
 
     if msg.startswith("CONFIRMNEW|"):
         ip = msg.split("|")[1]
         port = int(msg.split("|")[2])
         id = msg.split("|")[3]
+        nearest_id = msg.split("|")[4]
 
         if not received_first_view:
             with changed_servers_lock:
@@ -249,49 +268,56 @@ def FIFO_deliver(id, msg):
                 with R_b_lock, R_f_lock:
                     R_b[id] = 0
                     R_f[id] = 0
-                election(f"NEW|{id}", )
-                pr("Starting election")
+                election(f"NEW|{id}|{nearest_id}")
+            with inc_changes_lock:
+                if msg in inc_changes:
+                    inc_changes.remove(msg)
 
     if msg.startswith("AVG|"):
         avg = float(msg.split("|")[1])
-        group_size = int(msg.split("|")[2])
-        identifier = msg.split("|", 3)[3]
+        identifier = msg.split("|", 2)[2]
         with election_results_lock:
             if identifier not in election_results:
                 election_results[identifier] = {}
             election_results[identifier][id] = avg
-
-            if len(election_results[identifier]) == group_size:
-                results = election_results[identifier]
-
-                best_sid = min(results, key=lambda sid: (results[sid], sid))
-                best_rtt = results[best_sid]
-
-                pr(f"Election winner: {best_sid} (RTT {best_rtt})")
-
-                with leader_lock:
-                    leader = best_sid
-                    if leader == server_id:
-                        isLeader = True
-                        for msg in inc_changes:
-                            FIFO_multicast("CONFIRM" + msg)
-                        inc_changes = []
-                        leader_socket = None
-                    else:
-                        leader_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        leader_socket.connect((group_view[leader][0], group_view[leader][1]))
-                with leader_queue_lock:
-                    for msg in leader_queue:
-                        send_to_leader(msg)
-                del election_results[identifier]
+            if "participants" in election_results[identifier]:
+                if len(election_results[identifier]) - 1 == len(election_results[identifier]["participants"]):
+                    resolve_election(identifier)
 
     if msg.startswith("UPDATE|") and id != server_id:
         updates = json.loads(msg.split("|", 1)[1])
-        pr(f"Applying updates {updates}")
         apply_updates(updates)
 
+def resolve_election(identifier):
+    global inc_changes, isLeader, leader_socket, leader
+    results = election_results[identifier]
+    del results["participants"]
+    best_sid = min(results, key=lambda sid: (results[sid], sid))
+    best_rtt = results[best_sid]
+
+    pr(f"Election winner: {best_sid} (RTT {best_rtt}) for election {identifier}")
+
+    with leader_lock:
+        leader = best_sid
+        if leader == server_id:
+            isLeader = True
+            with inc_changes_lock:
+                for msg in inc_changes:
+                    pr("Multicasting from inc_changes:", msg, isLeader, leader)
+                    FIFO_multicast(msg)
+                inc_changes = []
+            leader_socket = None
+        else:
+            isLeader = False
+            leader_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            leader_socket.connect((group_view[leader][0], group_view[leader][1]))
+    with leader_queue_lock:
+        for msg in leader_queue:
+            send_to_leader(msg)
+    del election_results[identifier]
 
 def election(identifier):
+    pr("Starting election:", identifier)
     global isLeader, leader_socket
     with leader_lock:
         if leader_socket is not None:
@@ -306,6 +332,9 @@ def election(identifier):
         res.append(rtt)
     avg = sum(res) / len(res)
 
+    with election_results_lock, group_view_lock:
+        election_results[identifier] = {}
+        election_results[identifier]["participants"] = group_view.keys()
     with group_view_lock:
         FIFO_multicast(f"AVG|{avg}|{len(group_view)}|{identifier}")
 
@@ -368,7 +397,7 @@ def find_nearest_server():
         return None
 
 def discovery():
-    global leader, group_view, received_first_view, R_b, isLeader, R_f
+    global leader, group_view, received_first_view, R_b, isLeader, R_f, received_first_view
 
     nearest = find_nearest_server()
 
@@ -413,7 +442,7 @@ def discovery():
                     book_json = line[5:]
                     global order_book
                     with order_book_lock:
-                        order_book = restore_order_book(json.loads(book_json))
+                        order_book = json.loads(book_json)
                     pr("Received order book")
 
                 elif line.startswith("LEADER|"):
@@ -441,6 +470,7 @@ def discovery():
                             del group_view[crashed_server]
                         for new_server in new_servers:
                             group_view[new_server] = new_servers[new_server]
+                        received_first_view = True
                 else:
                     pr("Unknown line:", line)
 
@@ -479,7 +509,7 @@ def update(update):
         FIFO_multicast(f"UPDATE|{json.dumps(changes)}")
 
 def external_pay_out(uname, amount):
-    print(f"Transferred {-amount}€ to external account of {uname}")
+    pr(f"Transferred {-amount}€ to external account of {uname}")
 
 def external_pay_in(uname, amount):
     print(f"Received {amount}€ from external account of {uname}")
@@ -529,7 +559,7 @@ def make_matches(update):
 
             if amount < 0:
                 total_sell_orders = 0
-                for pr, amt, own in order_book[stock][1]:
+                for prc, amt, own in order_book[stock][1]:
                       if own == uname:
                           total_sell_orders += amt
 
@@ -551,12 +581,14 @@ def make_matches(update):
             total_buy_orders = 0
             for possible_stock in order_book:
                 if possible_stock != "Balance":
-                    for pr, amt, own in order_book[possible_stock][0]:
+                    for prc, amt, own in order_book[possible_stock][0]:
                         if own == uname:
-                            total_buy_orders += pr * amt
+                            total_buy_orders += prc * amt
             balance = max(order_book["Balance"][uname] - total_buy_orders, 0)
             max_affordable = balance // price
             amount = min(amount, max_affordable)
+            if amount <= 0:
+                return []
             if stock not in order_book:
                 order_book[stock] = ([],[],{})
             if len(order_book[stock][1]) > 0:
@@ -569,8 +601,6 @@ def make_matches(update):
                     offer_price = sell_orders[i][0]
                     offer_amount = sell_orders[i][1]
                     offer_user = sell_orders[i][2]
-                    print("amount, running amount", amount, running_amount)
-                    print("offer infos: ", offer_price, offer_amount, offer_user)
                     if offer_price > price:
                         updates.append(f"PUT_BUY_ORDER|{stock}|{price}|{amount - running_amount}|{uname}")
                         break
@@ -616,14 +646,15 @@ def make_matches(update):
                 return []
 
             total_sell_orders = 0
-            for pr, amt, own in order_book[stock][1]:
+            for prc, amt, own in order_book[stock][1]:
                   if own == uname:
                       total_sell_orders += amt
 
             stock_balance = order_book[stock][2].get(uname, 0) - total_sell_orders
             max_sellable = max(stock_balance, 0)
             amount = min(amount, max_sellable)
-
+            if amount <= 0:
+                return []
             if len(order_book[stock][0]) > 0:
                 running_amount = 0
                 gain = 0
@@ -668,6 +699,7 @@ def make_matches(update):
     return updates
 
 def apply_updates(updates):
+    pr(f"Applying updates {updates}")
     with order_book_lock:
         for update in updates:
             if update.startswith("BALANCE_CHANGE|"):
@@ -781,109 +813,134 @@ def handle_tcp(connection):
     ip, port = connection.getpeername()
     buffer = ""
     done = False
+    try:
+        while not crashed and not done:
+            data = connection.recv(4096).decode()
+            if not data:
+                break
 
-    while not crashed and not done:
-        data = connection.recv(4096).decode()
-        if not data:
-            break
+            buffer += data
 
-        buffer += data
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                msg = line.strip()
 
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            msg = line.strip()
+                if msg == "PING":
+                    connection.sendall("PONG\n".encode())
+                    done = True
 
-            if msg == "PING":
-                connection.sendall("PONG\n".encode())
-                done = True
+                elif msg.startswith("LOGIN|"):
+                    uname = msg.split("|")[1]
+                    pr(f"Client {uname} connected")
+                    with client_lock:
+                        client_list[(ip, port)] = uname
 
-            elif msg.startswith("LOGIN|"):
-                uname = msg.split("|")[1]
-                with client_lock:
-                    client_list[(ip, port)] = uname
+                elif msg == "REFRESH":
+                    send_info_client(connection)
 
-            elif msg == "REFRESH":
-                send_info_client(connection)
+                elif msg.startswith("BALANCE_CHANGE|"):
+                    if len(msg.split("|")) == 2:
+                        amount = msg.split("|")[1]
+                        client_id = get_client_id(ip, port)
+                    else:
+                        client_id = msg.split("|")[1]
+                        amount = msg.split("|")[2]
+                    send_to_leader(f"BALANCE_CHANGE|{client_id}|{amount}\n")
 
-            elif msg.startswith("BALANCE_CHANGE|"):
-                amount = msg.split("|")[1]
-                client_id = get_client_id(ip, port)
-                send_to_leader(f"BALANCE_CHANGE|{client_id}|{amount}\n")
+                elif msg.startswith("STOCK_TRANSFER|"):
+                    if len(msg.split("|")) == 3:
+                        client_id = get_client_id(ip, port)
+                        stock = msg.split("|")[1]
+                        amount = msg.split("|")[2]
+                    else:
+                        stock = msg.split("|")[1]
+                        client_id = msg.split("|")[2]
+                        amount = msg.split("|")[3]
+                    send_to_leader(f"STOCK_TRANSFER|{stock}|{client_id}|{amount}\n")
 
-            elif msg.startswith("STOCK_TRANSFER|"):
-                stock = msg.split("|")[1]
-                amount = msg.split("|")[2]
-                client_id = get_client_id(ip, port)
-                send_to_leader(f"STOCK_TRANSFER|{stock}|{client_id}|{amount}\n")
+                elif msg.startswith("BUY_ORDER|"):
+                    if len(msg.split("|")) == 4:
+                        stock = msg.split("|")[1]
+                        price = msg.split("|")[2]
+                        amount = msg.split("|")[3]
+                        client_id = get_client_id(ip, port)
+                    else:
+                        stock = msg.split("|")[1]
+                        price = msg.split("|")[2]
+                        amount = msg.split("|")[3]
+                        client_id = msg.split("|")[4]
+                    send_to_leader(f"BUY_ORDER|{stock}|{price}|{amount}|{client_id}\n")
 
-            elif msg.startswith("BUY_ORDER|"):
-                stock = msg.split("|")[1]
-                price = msg.split("|")[2]
-                amount = msg.split("|")[3]
-                client_id = get_client_id(ip, port)
-                send_to_leader(f"BUY_ORDER|{stock}|{price}|{amount}|{client_id}\n")
+                elif msg.startswith("SELL_ORDER"):
+                    if len(msg.split("|")) == 4:
+                        stock = msg.split("|")[1]
+                        price = msg.split("|")[2]
+                        amount = msg.split("|")[3]
+                        client_id = get_client_id(ip, port)
+                    else:
+                        stock = msg.split("|")[1]
+                        price = msg.split("|")[2]
+                        amount = msg.split("|")[3]
+                        client_id = msg.split("|")[4]
+                    send_to_leader(f"SELL_ORDER|{stock}|{price}|{amount}|{client_id}\n")
 
-            elif msg.startswith("SELL_ORDER"):
-                stock = msg.split("|")[1]
-                price = msg.split("|")[2]
-                amount = msg.split("|")[3]
-                client_id = get_client_id(ip, port)
-                send_to_leader(f"SELL_ORDER|{stock}|{price}|{amount}|{client_id}\n")
+                elif msg == "LOGOUT":
+                    pr(f"Client {get_client_id(ip, port)} disconnected")
+                    with client_lock:
+                        del client_list[(ip, port)]
+                    done = True
 
-            elif msg == "LOGOUT":
-                with client_lock:
-                    del client_list[(ip, port)]
-                done = True
+                elif msg.startswith("JOIN|"):
+                    new_ip = msg.split("|")[1]
+                    new_port = msg.split("|")[2]
+                    new_id = msg.split("|")[3]
+                    with order_book_lock, leader_lock, R_f_lock, R_b_lock, group_view_lock:
+                        connection.sendall(f"BOOK|{json.dumps(order_book)}\n".encode())
+                        connection.sendall(f"LEADER|{group_view[leader][0]}|{group_view[leader][1]}|{leader}\n".encode())
+                        connection.sendall(f"B_ACKS|{json.dumps(R_b)}\n".encode())
+                        connection.sendall(f"F_ACKS|{json.dumps(R_f)}\n".encode())
+                        connection.sendall(f"VIEW|{json.dumps(group_view)}\n".encode())
+                        pr(f"Sent infos to {ip, port, new_id}")
+                    buff = ""
+                    while "\n" not in buff:
+                        data = connection.recv(4096).decode()
+                        buff += data
+                    ack = buff.strip()
+                    if ack == "JOINED":
+                        FIFO_multicast(f"NEW|{new_ip}|{new_port}|{new_id}")
+                        pr(f"Let everyone know that {new_ip, new_port, new_id} has joined")
+                    else:
+                        pr("Didn't receive JOINED ACK")
+                    done = True
 
-            elif msg.startswith("JOIN|"):
-                new_ip = msg.split("|")[1]
-                new_port = msg.split("|")[2]
-                new_id = msg.split("|")[3]
-                with order_book_lock, leader_lock, R_f_lock, R_b_lock, group_view_lock:
-                    connection.sendall(f"BOOK|{json.dumps(order_book)}\n".encode())
-                    connection.sendall(f"LEADER|{group_view[leader][0]}|{group_view[leader][1]}|{leader}\n".encode())
-                    connection.sendall(f"B_ACKS|{json.dumps(R_b)}\n".encode())
-                    connection.sendall(f"F_ACKS|{json.dumps(R_f)}\n".encode())
-                    connection.sendall(f"VIEW|{json.dumps(group_view)}\n".encode())
-                    pr(f"Sent infos to {ip, port, new_id}")
-                buff = ""
-                while "\n" not in buff:
-                    data = connection.recv(4096).decode()
-                    buff += data
-                ack = buff.strip()
-                if ack == "JOINED":
-                    FIFO_multicast(f"NEW|{new_ip}|{new_port}|{new_id}")
-                    pr(f"Let everyone know that {new_ip, new_port, new_id} has joined")
+                # elif msg.startswith("B_ACK|"):
+                #     Seq_number = int(msg.split("|")[1])
+                #     id = msg.split("|")[2]
+                #     # pr(f"Received B_ACK from {id} about message {Seq_number}")
+                #     with sent_messages_lock:
+                #         if Seq_number in sent_messages:
+                #             acked_from = sent_messages[Seq_number]["acks"]
+                #             acked_from.add(id)
+                #             if all(e in sent_messages[Seq_number]["acks"] for e in group_view):
+                #                 # pr(f"Now deleting msg ({sent_messages[Seq_number]["msg"]}) from sent_messages")
+                #                 del sent_messages[Seq_number]
+                #     done = True
+
+                elif msg.startswith("NACK|"):
+                    s = int(msg.split("|")[1])
+                    r = int(msg.split("|")[2])
+                    with multicast_socket_lock:
+                        for i in range(r+1, s):
+                            multicast_socket.sendto(f"{i}|{server_id}|{sent_messages[i]["msg"]}".encode(), (MULTICAST_GROUP, MULTICAST_PORT))
+                    done = True
                 else:
-                    pr("Didn't receive JOINED ACK")
-                done = True
-
-            # elif msg.startswith("B_ACK|"):
-            #     Seq_number = int(msg.split("|")[1])
-            #     id = msg.split("|")[2]
-            #     # pr(f"Received B_ACK from {id} about message {Seq_number}")
-            #     with sent_messages_lock:
-            #         if Seq_number in sent_messages:
-            #             acked_from = sent_messages[Seq_number]["acks"]
-            #             acked_from.add(id)
-            #             if all(e in sent_messages[Seq_number]["acks"] for e in group_view):
-            #                 # pr(f"Now deleting msg ({sent_messages[Seq_number]["msg"]}) from sent_messages")
-            #                 del sent_messages[Seq_number]
-            #     done = True
-
-            elif msg.startswith("NACK|"):
-                s = int(msg.split("|")[1])
-                r = int(msg.split("|")[2])
-                with multicast_socket_lock:
-                    for i in range(r+1, s):
-                        multicast_socket.sendto(f"{i}|{server_id}|{sent_messages[i]["msg"]}".encode(), (MULTICAST_GROUP, MULTICAST_PORT))
-                done = True
-            else:
-                connection.sendall("Incorrect formatting!\n".encode())
-                done = True
-
+                    connection.sendall("Incorrect formatting!\n".encode())
+                    done = True
+    except ConnectionResetError:
+        pass
+    except OSError:
+        pass
     connection.close()
-
 
 def send_to_leader(msg):
     with leader_lock:
@@ -920,9 +977,9 @@ def broadcast_listen():
 
     while not crashed:
         data, addr = broadcast_socket.recvfrom(1024)
-        if data == "CRASH" and not crashed:
+        # if data == "CRASH" and not crashed:
             #election()
-            pr("starting election")
+            # pr("starting election")
     broadcast_socket.close()
 
 def crash():
@@ -933,6 +990,8 @@ def crash():
     broadcast_socket.sendto(str.encode(f"CRASH|{server_port}|{server_id}"), (broadcast_address, broadcast_port))
     FIFO_multicast(f"CRASH")
     multicast_socket.close()
+    if leader_socket is not None:
+        leader_socket.close()
     # notify leader who then distributes new view of servers
 
 def heartbeat():
