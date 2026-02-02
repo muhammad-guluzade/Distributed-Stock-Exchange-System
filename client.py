@@ -162,10 +162,11 @@ def select_best_server_loop():
 
 def user_input_loop():
     global tcp_sock, server_address, server_port, crashed
-
     while not crashed:
         # try:
-            time.sleep(2.5)
+            if not refresh:
+                time.sleep(2.5)
+            refresh = False
             display_market()
             msg = input(
                 "Choose one:\n"
@@ -316,6 +317,7 @@ def user_input_loop():
                         print("Your message could not be sent. Please try again.")
 
             elif msg == "7":
+                refresh = True
                 continue
 
             elif msg == "8":
