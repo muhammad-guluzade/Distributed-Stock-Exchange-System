@@ -14,14 +14,12 @@ broadcast_address = None
 broadcast_port = 1234
 server_socket = None
 crashed = False
-leader = None
-leader_lock = threading.Lock()
-isLeader = False
+
 group_view = {}
 group_view_lock = threading.Lock()
 
-order_book = {"NVIDIA": ([(200, 24, "Max"),(198, 55, "Paul")], [(205, 14, "Max"),(206, 66,  "Paul")],{"Max": 10000, "Paul":250}),
-              "APPLE":([],[],{}),
+order_book = {"NVIDIA": [[[200, 24, "Max"],[198, 55, "Paul"]], [[205, 14, "Max"],[206, 66,  "Paul"]],{"Max": 10000, "Paul":250}],
+              "APPLE":[[],[],{}],
               "Balance": {"Max": 5000, "Paul":12000}}
 order_book_lock = threading.Lock()
 
@@ -42,9 +40,10 @@ delivery_lock = threading.Lock()
 received_first_view = False
 received_first_view_lock = threading.Lock()
 crashed_servers = []
-new_servers = []
+new_servers = {}
 changed_servers_lock = threading.Lock()
 inc_changes = []
+inc_changes_lock = threading.Lock()
 multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
 multicast_socket_lock = threading.Lock()
@@ -234,11 +233,11 @@ def FIFO_deliver(id, msg):
             with group_view_lock:
                 change = f"CONFIRMCRASH|{id}"
                 if id in group_view:
-                    if change in inc_changes:
-                        inc_changes.remove(change)
+                    with inc_changes_lock:
+                        if change in inc_changes:
+                            inc_changes.remove(change)
                         del group_view[id]
-            election(change)
-            pr("Starting election")
+            election(f"CRASH|{id}")
 
     if msg.startswith("NEW|"):
         nearest_id = id
@@ -336,12 +335,25 @@ def election(identifier):
         election_results[identifier] = {}
         election_results[identifier]["participants"] = group_view.keys()
     with group_view_lock:
-        FIFO_multicast(f"AVG|{avg}|{len(group_view)}|{identifier}")
+        FIFO_multicast(f"AVG|{avg}|{identifier}")
 
+def measure_server_rtt(ip, port, timeout=2):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
 
-def apply_update(update):
-    with order_book_lock:
-        pass
+        start = time.time()
+        s.connect((ip, port))
+        s.sendall(f"PING\n".encode())
+        data = s.recv(1024)
+        rtt = time.time() - start
+        s.close()
+
+        if not data:
+            return float("inf")
+        return rtt
+    except Exception:
+        return float("inf")
 
 def nack(S, id, R):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -463,7 +475,7 @@ def discovery():
                         pr("Received FIFO sequence numbers:", R_f)
 
                 elif line.startswith("VIEW|"):
-                    with group_view_lock, changed_servers_lock:
+                    with group_view_lock, changed_servers_lock, received_first_view_lock:
                         group_view = json.loads(line.split("|")[1])
                         pr("Received view:", group_view)
                         for crashed_server in crashed_servers:
@@ -486,10 +498,8 @@ def discovery():
                         time.sleep(5)
                     nearest = find_nearest_server()
 
-    # election
-    # choose most up-to-date order book and distribute it
-    # start multicast listener thread for updates from leader
-    # or if elected start thread for backend and distributing updates
+    # tcp connection to leader
+    # multicast updates
     return True
 
 def connection_listen():
@@ -512,13 +522,13 @@ def external_pay_out(uname, amount):
     pr(f"Transferred {-amount}€ to external account of {uname}")
 
 def external_pay_in(uname, amount):
-    print(f"Received {amount}€ from external account of {uname}")
+    pr(f"Received {amount}€ from external account of {uname}")
 
 def external_stock_in(uname, stock, amount):
-    print(f"Received {amount} stocks of {stock} from external account of {uname}")
+    pr(f"Received {amount} stocks of {stock} from external account of {uname}")
 
 def external_stock_out(uname, stock, amount):
-    print(f"Transferred {-amount} stocks of {stock} to external account of {uname}")
+    pr(f"Transferred {-amount} stocks of {stock} to external account of {uname}")
 
 def make_matches(update):
 
@@ -534,9 +544,9 @@ def make_matches(update):
                 total_buy_orders = 0
                 for possible_stock in order_book:
                     if possible_stock != "Balance":
-                        for pr, amt, own in order_book[possible_stock][0]:
+                        for prc, amt, own in order_book[possible_stock][0]:
                             if own == uname:
-                                total_buy_orders += pr * amt
+                                total_buy_orders += prc * amt
                 balance = max(order_book["Balance"][uname] - total_buy_orders, 0)
 
                 if balance < -amount:
@@ -608,10 +618,6 @@ def make_matches(update):
                     elif offer_amount < amount - running_amount:
                         running_amount += offer_amount
                         cost += offer_amount * offer_price
-                        print("running amount", running_amount)
-                        print("offer amount", offer_amount)
-                        print("offer price", offer_price)
-                        print("cost", cost)
                         updates.append(f"BALANCE_CHANGE|{offer_user}|{offer_amount * offer_price}")
                         updates.append(f"STOCK_TRANSFER|{stock}|{offer_user}|{-offer_amount}")
                         updates.append(f"REDUCE_SELL_ORDER|{stock}|{offer_price}|{offer_amount}|{offer_user}|{offer_amount}")
@@ -951,22 +957,6 @@ def send_to_leader(msg):
         else:
             with leader_queue_lock:
                 leader_queue.append(msg)
-
-def restore_order_book(book):
-    restored = {}
-
-    for symbol, value in book.items():
-        if symbol == "Balance":
-            restored[symbol] = (
-                [tuple(entry) for entry in value]
-                ,)
-        else:
-            restored[symbol] = tuple(
-                [tuple(entry) for entry in sublist]
-                for sublist in value
-            )
-
-    return restored
 
 def broadcast_listen():
     global crashed, broadcast_port

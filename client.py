@@ -2,6 +2,7 @@ import json
 import socket
 import threading
 import time
+import os
 
 broadcast_port = 1234
 
@@ -39,7 +40,6 @@ def broadcast_listener():
         data, addr = broadcast_sock.recvfrom(1024)
         msg = data.decode().strip()
         ip = addr[0]
-
         parts = msg.split("|")
 
         msg, port_str, id_str = parts
@@ -97,8 +97,8 @@ def connect_tcp(ip, port):
 def switch_connection(ip, port):
     global tcp_sock, server_address, server_port
 
-    if tcp_sock is not None:
-        with tcp_lock:
+    with tcp_lock:
+        if tcp_sock is not None:
             tcp_sock.sendall(f"LOGOUT\n".encode())
             tcp_sock.close()
     new_sock = connect_tcp(ip, port)
@@ -118,7 +118,6 @@ def select_best_server_loop():
         with lock:
             nodes = list(servers)
 
-        # 🚨 NO SERVERS AT ALL
         if not nodes:
             with tcp_lock:
                 no_connection = tcp_sock is None
@@ -128,7 +127,6 @@ def select_best_server_loop():
                 connection_lost_logged = True
             continue
 
-        # Measure RTTs
         best = None
         best_rtt = float("inf")
 
@@ -139,7 +137,6 @@ def select_best_server_loop():
                 best_rtt = rtt
                 best = (ip, port)
 
-        # 🚨 Servers exist but none reachable
         if best is None or best_rtt == float("inf"):
             with tcp_lock:
                 no_connection = tcp_sock is None
@@ -149,7 +146,6 @@ def select_best_server_loop():
                 connection_lost_logged = True
             continue
 
-        # A working server exists
         connection_lost_logged = False
 
         with tcp_lock:
@@ -158,6 +154,39 @@ def select_best_server_loop():
         if cur != best:
             print("🔁 Connecting to best server:", best)
             switch_connection(*best)
+
+def clear():
+    print("\n" * 50)
+
+
+def display_market():
+    clear()
+    while order_book is None:
+        time.sleep(0.5)
+
+    print("====== MARKET ======\n")
+
+    if order_book is None:
+        print("No data yet...")
+        return
+
+    for stock, (buys, sells) in order_book.items():
+        print(f"[{stock}]")
+
+        print("  BUY (bids)")
+        for p, a, u in buys:
+            print(f"   {p:>6} | {a:>5} | {u}")
+
+        print("  SELL (asks)")
+        for p, a, u in sells:
+            print(f"   {p:>6} | {a:>5} | {u}")
+
+        print()
+
+    print(f"Balance: {balance}")
+    print(f"Owned: {owned_stocks}")
+    print("====================")
+
 
 
 def user_input_loop():
@@ -206,7 +235,10 @@ def user_input_loop():
                     continue
                 else:
                     with tcp_lock:
-                        tcp_sock.sendall(f"BALANCE_CHANGE|{-int(amount)}\n".encode())
+                        if tcp_sock:
+                            tcp_sock.sendall(f"BALANCE_CHANGE|{-int(amount)}\n".encode())
+                        else:
+                            print("Your message could not be sent. Please try again.")
 
             elif msg == "3":
                 stock = input("Stock symbol: ")
@@ -220,7 +252,10 @@ def user_input_loop():
                     time.sleep(2)
                     continue
                 with tcp_lock:
-                    tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{amount}\n".encode())
+                    if tcp_sock:
+                        tcp_sock.sendall(f"STOCK_TRANSFER|{stock}|{amount}\n".encode())
+                    else:
+                        print("Your message could not be sent. Please try again.")
 
             elif msg == "4":
                 stock = input("Stock symbol: ")
@@ -320,10 +355,14 @@ def user_input_loop():
                 refresh = True
                 continue
 
-            elif msg == "8":
-                tcp_sock.sendall("LOGOUT\n".encode())
-                tcp_sock.close()
-                print("You logged out")
+            elif msg == "8" or msg == "9":
+                with tcp_lock:
+                    tcp_sock.sendall("LOGOUT\n".encode())
+                    tcp_sock.close()
+                    tcp_sock = None
+                crashed = True
+                if msg == "8":
+                    print("You logged out")
                 break
 
         # except Exception:
@@ -367,9 +406,14 @@ def refresher():
 
                     elif line.startswith("OWNED_STOCKS|"):
                         owned_stocks = json.loads(line.split("|", 1)[1])
-        time.sleep(5)
+        time.sleep(2)
 
 if __name__ == "__main__":
+    username = input("Enter username:\n")
+    # username = "Eric"
+    print(f"Hello, {username}!")
+
+    threading.Thread(target=refresher, daemon=True).start()
     threading.Thread(target=broadcast_listener, daemon=True).start()
     threading.Thread(target=select_best_server_loop, daemon=True).start()
 
@@ -381,6 +425,7 @@ if __name__ == "__main__":
                 break
         time.sleep(0.2)
 
+    print(f"Connecting to first server: {first[0]}:{first[1]}")
     switch_connection(*first)
 
     threading.Thread(target=user_input_loop, daemon=True).start()
