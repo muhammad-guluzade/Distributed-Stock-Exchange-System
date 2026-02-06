@@ -2,7 +2,6 @@ import json
 import socket
 import threading
 import time
-import os
 
 broadcast_port = 1234
 
