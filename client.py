@@ -142,8 +142,6 @@ def select_best_server_loop():
         if best is None or best_rtt == float("inf"):
             with tcp_lock:
                 no_connection = tcp_sock is None
-            if no_connection:
-                print(nodes)
             if no_connection and not connection_lost_logged:
                 print("🔍 Servers found but none responding. Retrying...")
                 connection_lost_logged = True
