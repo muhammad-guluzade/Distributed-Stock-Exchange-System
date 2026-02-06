@@ -416,7 +416,6 @@ def refresher():
 
 if __name__ == "__main__":
     username = input("Enter username:\n")
-    # username = "Eric"
     print(f"Hello, {username}!")
 
     threading.Thread(target=refresher, daemon=True).start()
