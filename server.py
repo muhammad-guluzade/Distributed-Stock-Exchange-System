@@ -919,6 +919,7 @@ def handle_tcp(connection):
                         pr("Didn't receive JOINED ACK")
                     done = True
 
+                # cant delete messages without risking loss of messages (probably)
                 # elif msg.startswith("B_ACK|"):
                 #     Seq_number = int(msg.split("|")[1])
                 #     id = msg.split("|")[2]
@@ -982,7 +983,6 @@ def crash():
     multicast_socket.close()
     if leader_socket is not None:
         leader_socket.close()
-    # notify leader who then distributes new view of servers
 
 def heartbeat():
     global crashed, broadcast_address, broadcast_port, server_port
