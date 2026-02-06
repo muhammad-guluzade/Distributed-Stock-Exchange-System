@@ -191,6 +191,7 @@ def display_market():
 
 def user_input_loop():
     global tcp_sock, server_address, server_port, crashed
+    refresh = False
     while not crashed:
         # try:
             if not refresh:
