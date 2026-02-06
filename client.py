@@ -125,7 +125,7 @@ def select_best_server_loop():
                 no_connection = tcp_sock is None
 
             if no_connection and not connection_lost_logged:
-                print("🔍 No servers available. Waiting and retrying...")
+                print("No servers available. Waiting and retrying...")
                 connection_lost_logged = True
             continue
 
@@ -143,7 +143,7 @@ def select_best_server_loop():
             with tcp_lock:
                 no_connection = tcp_sock is None
             if no_connection and not connection_lost_logged:
-                print("🔍 Servers found but none responding. Retrying...")
+                print("Servers found but none responding. Retrying...")
                 connection_lost_logged = True
             continue
 
@@ -153,7 +153,7 @@ def select_best_server_loop():
             cur = (server_address, server_port)
 
         if cur != best:
-            print("🔁 Connecting to best server:", best)
+            print("Connecting to best server:", best)
             switch_connection(*best)
 
 def clear():
@@ -386,28 +386,32 @@ def refresher():
     while not crashed:
         with tcp_lock:
             if tcp_sock is not None:
-                tcp_sock.sendall(f"REFRESH\n".encode())
-                buffer = ""
-                lines = []
-                while not crashed and len(lines) < 3:
-                    chunk = tcp_sock.recv(4096).decode()
-                    if not chunk:
-                        raise ConnectionError("Server closed connection during startup")
+                try:
+                    tcp_sock.sendall(f"REFRESH\n".encode())
+                    buffer = ""
+                    lines = []
+                    while not crashed and len(lines) < 3:
+                        chunk = tcp_sock.recv(4096).decode()
+                        if not chunk:
+                            raise ConnectionError("Server closed connection during startup")
 
-                    buffer += chunk
-                    while "\n" in buffer and len(lines) < 3:
-                        line, buffer = buffer.split("\n", 1)
-                        lines.append(line)
+                        buffer += chunk
+                        while "\n" in buffer and len(lines) < 3:
+                            line, buffer = buffer.split("\n", 1)
+                            lines.append(line)
 
-                for line in lines:
-                    if line.startswith("ORDERS|"):
-                        order_book = json.loads(line.split("|", 1)[1])
+                    for line in lines:
+                        if line.startswith("ORDERS|"):
+                            order_book = json.loads(line.split("|", 1)[1])
 
-                    elif line.startswith("BALANCE|"):
-                        balance = int(line.split("|")[1])
+                        elif line.startswith("BALANCE|"):
+                            balance = int(line.split("|")[1])
 
-                    elif line.startswith("OWNED_STOCKS|"):
-                        owned_stocks = json.loads(line.split("|", 1)[1])
+                        elif line.startswith("OWNED_STOCKS|"):
+                            owned_stocks = json.loads(line.split("|", 1)[1])
+                except OSError:
+                    print("Server crashed while attempting to get updates.")
+                    pass
         time.sleep(2)
 
 if __name__ == "__main__":
