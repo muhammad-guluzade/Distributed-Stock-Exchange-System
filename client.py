@@ -77,7 +77,7 @@ def measure_server_rtt(ip, port, timeout=2):
 
         start = time.time()
         s.connect((ip, port))
-        s.sendall("PING".encode())
+        s.sendall("PING\n".encode())
         data = s.recv(1024)
         rtt = time.time() - start
         s.close()
@@ -86,6 +86,8 @@ def measure_server_rtt(ip, port, timeout=2):
             return float("inf")
         return rtt
     except socket.timeout:
+        return float("inf")
+    except ConnectionRefusedError:
         return float("inf")
 
 def connect_tcp(ip, port):
@@ -140,7 +142,8 @@ def select_best_server_loop():
         if best is None or best_rtt == float("inf"):
             with tcp_lock:
                 no_connection = tcp_sock is None
-
+            if no_connection:
+                print(nodes)
             if no_connection and not connection_lost_logged:
                 print("🔍 Servers found but none responding. Retrying...")
                 connection_lost_logged = True
